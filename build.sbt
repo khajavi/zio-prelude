@@ -1,4 +1,6 @@
 import BuildHelper._
+import zio.sbt.ZioSbtCiPlugin._
+import zio.sbt.githubactions.{Condition, DependencyBot, Job, Step, Strategy}
 
 inThisBuild(
   List(
@@ -12,15 +14,100 @@ inThisBuild(
         "john@degoes.net",
         url("http://degoes.net")
       )
-    )
+    ),
+
+    // zio-sbt-ci settings: keep the generated ci.yml matching what this project's handwritten
+    // workflow already tested (master + zio-2, one grouped test job per Scala version covering
+    // all platforms at JDK 17, a JDK 11 JVM-only re-run, and JDK 8 for the build/publish/release
+    // jobs since artifacts are published for JDK 8) rather than the plugin's stock defaults.
+    ciEnabledBranches     := Seq("master", "zio-2"),
+    // Preserves the memory/stack tuning the old workflow applied to every job, and the swap space
+    // that cross-building JVM+JS+Native across four Scala versions needed to avoid OOM/disk
+    // pressure. `JVM_OPTS` (rather than `SBT_OPTS`) matches the old workflow's naming, since it's
+    // read by the JDK 8 jobs, which don't understand `JDK_JAVA_OPTIONS`.
+    ciJvmOptions          := Seq("-XX:MaxMetaspaceSize=4G", "-Xmx4G", "-Xss8M"),
+    ciWorkflowEnv         := {
+      val flags = ("-XX:+PrintCommandLineFlags" +: ciJvmOptions.value).mkString(" ")
+      Map("JDK_JAVA_OPTIONS" -> flags, "JVM_OPTS" -> flags)
+    },
+    ciSwapSizeGB          := 7,
+    ciDependencyUpdateBots := Seq(
+      DependencyBot.Dependabot,
+      DependencyBot.Renovate,
+      DependencyBot.Custom("scala-steward")
+    ),
+    ciTargetScalaVersions := targetScalaVersionsFor(
+      (projectsCommon.flatMap(p => Seq(p.jvm, p.js, p.native)) ++ Seq(benchmarks, scalaParallelCollections)): _*
+    ).value,
+    ciGroupSimilarTests  := true,
+    ciTargetJavaVersions := Seq("17"),
+    // JDK-8-only re-run of the JVM projects, mirroring the old `testJvms` job. JDK 17 is already
+    // covered by the grouped `test` job above, so only 11 is added here.
+    ciTestJobs           := ciTestJobs.value :+ Job(
+      id = "testJvms",
+      name = "Test JVMs",
+      strategy = Some(Strategy(matrix = Map("java" -> List("11")), failFast = false)),
+      steps = (if (ciSwapSizeGB.value > 0) Seq(SetSwapSpace.value) else Seq.empty) ++ Seq(
+        Checkout.value,
+        SetupLibuv,
+        SetupJava("${{ matrix.java }}"),
+        SetupSBT,
+        CacheDependencies,
+        Step.SingleStep(
+          name = "Test",
+          run = Some(
+            "sbt --no-colors " + Seq(
+              "coreJVM",
+              "coreTestsJVM",
+              "lawsJVM",
+              "macrosJVM",
+              "experimentalJVM",
+              "experimentalLawsJVM",
+              "experimentalTestsJVM",
+              "examplesJVM",
+              "benchmarks",
+              "scalaParallelCollections"
+            ).map(_ + "/test").mkString(" ")
+          )
+        )
+      )
+    ),
+    // The build (compile + publishLocal + website) and release jobs must run on JDK 8: published
+    // artifacts target JDK 8, which is only actually exercised by compiling under it.
+    ciBuildJobs           := ciBuildJobs.value.map(onJava8),
+    // The plugin's default snapshot condition only publishes pushes to the *default* branch; the
+    // old workflow published (or, on a tag, released) on any non-pull-request event, which
+    // includes pushes to `zio-2`. Restore that so `zio-2` keeps getting SNAPSHOT publishes.
+    ciReleaseJobs         := ciReleaseJobs.value.map(onJava8).map {
+      case job if job.id == "release" =>
+        job.copy(condition =
+          Some(
+            (Condition.Expression("github.event_name == 'release'") && Condition.Expression(
+              "github.event.action == 'published'"
+            )) ||
+              Condition.Expression("github.event_name == 'workflow_dispatch'") ||
+              Condition.Expression("github.event_name == 'push'")
+          )
+        )
+      case job                        => job
+    }
   )
 )
+
+def onJava8(job: Job): Job =
+  job.copy(steps = job.steps.map {
+    case s: Step.SingleStep if s.name == "Setup Scala" => SetupJava("8")
+    case other                                         => other
+  })
 
 addCommandAlias("fix", "; all compile:scalafix test:scalafix; all scalafmtSbt scalafmtAll")
 addCommandAlias(
   "check",
   "; scalafmtSbtCheck; scalafmtCheckAll; Test/compile; compile:scalafix --check; test:scalafix --check"
 )
+// The `lint` job zio-sbt-ci generates by default runs `sbt lint`; alias it to this project's own
+// formatting/scalafix check rather than pulling in zio-sbt-ecosystem for its `lint` command.
+addCommandAlias("lint", "check")
 
 val zioVersion = "1.0.17"
 
@@ -40,49 +127,18 @@ val projectsJvmOnly = List[ProjectReference](
   scalaParallelCollections
 )
 
-lazy val rootJVM = project
-  .in(file("target/rootJVM"))
-  .settings(publish / skip := true)
-  .aggregate(projectsCommon.map(_.jvm: ProjectReference): _*)
-  .aggregate(projectsJvmOnly: _*)
-
-lazy val rootJS = project
-  .in(file("target/rootJS"))
-  .settings(publish / skip := true)
-  .aggregate(projectsCommon.map(_.js: ProjectReference): _*)
-
-lazy val rootNative = project
-  .in(file("target/rootNative"))
-  .settings(publish / skip := true)
-  .aggregate(projectsCommon.map(_.native: ProjectReference): _*)
-
-lazy val root211 = project
-  .in(file("target/root211"))
-  .settings(publish / skip := true)
-  .aggregate(projectsCommon.flatMap(p => List[ProjectReference](p.jvm, p.js, p.native)): _*)
-  .aggregate(scalaParallelCollections)
-
-lazy val root212 = project
-  .in(file("target/root212"))
-  .settings(publish / skip := true)
-  .aggregate(projectsCommon.flatMap(p => List[ProjectReference](p.jvm, p.js, p.native)): _*)
-  .aggregate(benchmarks, scalaParallelCollections)
-
-lazy val root213 = project
-  .in(file("target/root213"))
-  .settings(publish / skip := true)
-  .aggregate(projectsCommon.flatMap(p => List[ProjectReference](p.jvm, p.js, p.native)): _*)
-  .aggregate(projectsJvmOnly: _*)
-
-lazy val root3 = project
-  .in(file("target/root3"))
-  .settings(publish / skip := true)
-  .aggregate(root212)
-
 lazy val root = project
   .in(file("."))
-  .settings(publish / skip := true)
-  .aggregate(root213)
+  .settings(
+    publish / skip     := true,
+    // `Nil` rather than the default `Seq(scalaVersion.value)`: `root` isn't itself cross-built,
+    // and this is what lets top-level `+Test/compile`/`+publishLocal` (as run by the zio-sbt-ci
+    // `build` job) cross-build over each aggregated project's own `crossScalaVersions` instead of
+    // just root's.
+    crossScalaVersions := Nil
+  )
+  .aggregate(projectsCommon.flatMap(p => List[ProjectReference](p.jvm, p.js, p.native)): _*)
+  .aggregate(projectsJvmOnly: _*)
 
 lazy val core = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .in(file("core"))
@@ -237,14 +293,9 @@ lazy val docs = project
     moduleName        := "zio-prelude-docs",
     scalacOptions -= "-Yno-imports",
     scalacOptions -= "-Xfatal-warnings",
-    projectName       := "ZIO Prelude",
-    badgeInfo         := Some(
-      BadgeInfo(
-        artifact = "zio-prelude_2.12",
-        projectStage = ProjectStage.ProductionReady
-      )
-    ),
-    docsPublishBranch := "master"
+    projectName     := "ZIO Prelude",
+    projectStage    := ProjectStage.ProductionReady,
+    badgeArtifactId := "zio-prelude_2.12"
   )
   .settings(macroDefinitionSettings)
   .dependsOn(core.jvm, experimental.jvm, experimentalLaws.jvm, laws.jvm, scalaParallelCollections)
